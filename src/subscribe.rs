@@ -17,23 +17,28 @@ pub struct PaymentTaskRow {
     pub tries_left: i32,
     pub error: String,
     pub processing: bool,
-    pub next_try_at: String,
-    pub created_at: String,
-    pub updated_at: String
+    // pub next_try_at: String,
+    // pub created_at: String,
+    // pub updated_at: String
 }
 
 
 impl From<Row> for PaymentTaskRow {
     fn from(row: Row) -> Self {
+        let error = match row.get("error") {
+            Some(error) => error,
+            None => ""
+        };
+
         Self {
             id: row.get("id"),
             payment_id: row.get("payment_id"),
             tries_left: row.get("tries_left"),
-            error: row.get("error"),
+            error: error.to_string(),
             processing: row.get("processing"),
-            next_try_at: row.get("next_try_at"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at")
+            // next_try_at: row.get("next_try_at"),
+            // created_at: row.get("created_at"),
+            // updated_at: row.get("updated_at")
         }
     }
 }
@@ -69,7 +74,7 @@ fn next() -> Result<PaymentTaskRow, postgres::Error> {
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        RETURNING *
+        RETURNING id, payment_id, tries_left, error, processing
     "#;
     let row = pg.query_one(query, &[])?;
 
