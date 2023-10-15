@@ -4,46 +4,17 @@ extern crate dotenv;
 
 use dotenv::dotenv;
 use std::env;
+use chrono::{DateTime, Local, Utc, NaiveDateTime};
 use postgres::{Client, NoTls};
 use postgres::row::Row;
 use indicatif::ProgressBar;
+use std::{thread, time};
 
 use crate::db;
-
-#[derive(Debug)]
-pub struct PaymentTaskRow {
-    pub id: i32,
-    pub payment_id: i32,
-    pub tries_left: i32,
-    pub error: String,
-    pub processing: bool,
-    // pub next_try_at: String,
-    // pub created_at: String,
-    // pub updated_at: String
-}
+use crate::model::{PaymentTask, Payment, User, Product};
 
 
-impl From<Row> for PaymentTaskRow {
-    fn from(row: Row) -> Self {
-        let error = match row.get("error") {
-            Some(error) => error,
-            None => ""
-        };
-
-        Self {
-            id: row.get("id"),
-            payment_id: row.get("payment_id"),
-            tries_left: row.get("tries_left"),
-            error: error.to_string(),
-            processing: row.get("processing"),
-            // next_try_at: row.get("next_try_at"),
-            // created_at: row.get("created_at"),
-            // updated_at: row.get("updated_at")
-        }
-    }
-}
-
-fn next() -> Result<PaymentTaskRow, postgres::Error> {
+fn next() -> Option<PaymentTask> {
 
     let desc: String = db::connection_desc();
     let mut pg = match Client::connect(&desc, NoTls) {
@@ -74,18 +45,101 @@ fn next() -> Result<PaymentTaskRow, postgres::Error> {
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        RETURNING id, payment_id, tries_left, error, processing
+        RETURNING id, payment_id, tries_left, error, processing, updated_at
     "#;
-    let row = pg.query_one(query, &[])?;
+    let result = match pg.query_one(query, &[]) {
+        Ok(result) => Some(PaymentTask::from(result)),
+        Err(desc) => None
+    };
 
-    Ok(PaymentTaskRow::from(row))
+    result
+}
+
+fn success(payment_task: PaymentTask, payment: Payment, new_balance: i32) -> () {
+
+    let desc: String = db::connection_desc();
+    let mut pg = match Client::connect(&desc, NoTls) {
+        Ok(pg) => pg,
+        Err(err_desc) => panic!("{:?}", err_desc)
+    };
+
+    // update user's with new balance
+    let mut q = "update users set balance = $1 where id = $2";
+    if let Err(err_update) = pg.execute(q, &[&new_balance, &payment.user_id]) {
+        panic!("{:?}", err_update);
+    }
+    // update payment with success state
+    let mut q = "update payments set status = $1 where id = $2";
+    if let Err(err_update) = pg.execute(q, &[&"accepted", &payment_task.payment_id]) {
+        panic!("{:?}", err_update);
+    }
+
+    // remove message from queue
+    let query = "delete from payment_tasks where id = $1";
+    if let Err(err_delete) = pg.execute(query, &[&payment_task.id]) {
+        panic!("{:?}", err_delete);
+    }
+}
+
+fn failed (payment_task: PaymentTask, user: User, payment: Payment) -> () {
+    let desc: String = db::connection_desc();
+    let mut pg = match Client::connect(&desc, NoTls) {
+        Ok(pg) => pg,
+        Err(err_desc) => panic!("{:?}", err_desc)
+    };
+}
+
+fn perform(payment_task: PaymentTask) -> () {
+    println!("{:?}", payment_task);
+
+    let desc: String = db::connection_desc();
+    let mut pg = match Client::connect(&desc, NoTls) {
+        Ok(pg) => pg,
+        Err(err_desc) => panic!("{:?}", err_desc)
+    };
+
+    let mut q = "select * from payments where id = $1";
+    let payment = match pg.query_one(q, &[&payment_task.payment_id]) {
+        Ok(payment) => Payment::from(payment),
+        Err(desc) => panic!("No payment was found")
+    };
+    println!("{:?}", payment);
+
+    let mut q = "select * from users where id = $1";
+    let user = match pg.query_one(q, &[&payment.user_id]) {
+        Ok(user) => User::from(user),
+        Err(desc) => panic!("no user found")
+    };
+    println!("{:?}", user);
+
+    let mut q = "select * from products where id = $1";
+    let product = match pg.query_one(q, &[&payment.product_id]) {
+        Ok(product) => Product::from(product),
+        Err(desc) => panic!("no user found")
+    };
+    println!("{:?}", user);
+
+    let balance: i32 = user.balance;
+    let price: i32 = product.price;
+    let new_balance: i32 = balance - price;
+
+    if new_balance < 0 {
+        failed(payment_task, user, payment)
+    } else {
+        success(payment_task, payment, new_balance)
+    }
 
 }
 
 pub fn attach() -> Result<(), std::io::Error> {
+    let ten_millis = time::Duration::from_millis(5);
     loop {
-        let payment_task = next();
-        println!("{:?}", payment_task)
+        if let Some(payment_task) = next(){
+            perform(payment_task);
+        } else {
+            println!("waiting ...");
+            thread::sleep(ten_millis)
+        }
     }
 
     Ok(())

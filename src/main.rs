@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 mod db;
 mod publish;
 mod subscribe;
+mod model;
 
 #[derive(Subcommand)]
 enum Cmd {
