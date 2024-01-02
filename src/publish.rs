@@ -23,11 +23,7 @@ pub fn payments(n: i32) -> Result<(), std::io::Error> {
     }
 
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
-
+    let mut pg = db::get_connection();
     println!("Populating users");
 
     let bar = ProgressBar::new(n as u64);

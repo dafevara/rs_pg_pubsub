@@ -1,6 +1,8 @@
 #![allow(unused)]
 
 use clap::{Parser, Subcommand};
+use tokio::sync::Mutex;
+use futures::executor::block_on;
 
 mod db;
 mod publish;
@@ -33,7 +35,15 @@ struct Cli {
     command: Option<Cmd>,
 }
 
-fn main() {
+async fn async_attach() {
+    if let Err(e) = subscribe::attach().await {
+        panic!("An error occurred: {}", e);
+    }
+    // futures::join!(r)
+}
+
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
@@ -53,13 +63,8 @@ fn main() {
             }
         },
         Some(Cmd::Subscribe {channel, workers}) => {
-            if let Err(err_subscribe) = subscribe::attach() {
-                panic!("{:?}", err_subscribe)
-            }
+            async_attach().await;
         },
         None => {}
     }
-
-
-
 }

@@ -5,22 +5,23 @@ extern crate dotenv;
 use dotenv::dotenv;
 use std::env;
 use chrono::{DateTime, Local, Utc, NaiveDateTime};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, Error};
 use postgres::row::Row;
 use indicatif::ProgressBar;
 use std::{thread, time};
+use tokio::task;
+use tokio_postgres::{NoTls, Error as PgError};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::db;
 use crate::model::{PaymentTask, Payment, User, Product};
 
 
-fn next() -> Option<PaymentTask> {
+async fn next() -> Result<Option<PaymentTask>, PgError> {
 
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let pg = db::get_client().await?;
 
     let query = r#"
         UPDATE payment_tasks SET
@@ -47,21 +48,16 @@ fn next() -> Option<PaymentTask> {
         )
         RETURNING id, payment_id, tries_left, error, processing, updated_at
     "#;
-    let result = match pg.query_one(query, &[]) {
-        Ok(result) => Some(PaymentTask::from(result)),
-        Err(desc) => None
-    };
 
-    result
+    let row = pg.query_one(query, &[]).await?;
+    let p_task = PaymentTask::from(row);
+
 }
 
 fn success(payment_task: PaymentTask, payment: Payment, product: Product, new_balance: i32) -> () {
 
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let mut pg = db::get_client();
 
     // update user's with new balance
     let mut q = "update users set balance = $1 where id = $2";
@@ -98,10 +94,7 @@ fn failed_by_balance (payment_task: PaymentTask, user: User, payment: Payment, p
     let msg = format!("Unable to pay because price: {} is greater than balance {}", price, balance);
 
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let mut pg = db::get_client();
 
     let mut q = "update payment_tasks set error = $1 where id = $2";
     if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]) {
@@ -117,10 +110,7 @@ fn failed_by_balance (payment_task: PaymentTask, user: User, payment: Payment, p
 fn failed_by_stock (payment_task: PaymentTask, user: User, payment: Payment) -> () {
     let msg = "Unable to pay because there's no stock";
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let mut pg = db::get_client();
 
     let mut q = "update payment_tasks set error = $1 where id = $2";
     if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]) {
@@ -133,14 +123,11 @@ fn failed_by_stock (payment_task: PaymentTask, user: User, payment: Payment) -> 
     }
 }
 
-fn perform(payment_task: PaymentTask) -> () {
+async fn perform(payment_task: PaymentTask) -> () {
     println!("Processing Task: {:?}", payment_task);
 
     let desc: String = db::connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let mut pg = db::get_client();
 
     let mut q = "select * from payments where id = $1";
     let payment = match pg.query_one(q, &[&payment_task.payment_id]) {
@@ -181,14 +168,32 @@ fn perform(payment_task: PaymentTask) -> () {
 
 }
 
-pub fn attach() -> Result<(), std::io::Error> {
-    let ten_millis = time::Duration::from_millis(5);
+// pub fn attach() -> Result<(), std::io::Error> {
+//     let ten_millis = time::Duration::from_millis(5);
+//     loop {
+//         if let Some(payment_task) = next(){
+//             perform(payment_task);
+//         } else {
+//             println!("waiting ...");
+//             thread::sleep(ten_millis)
+//         }
+//     }
+//
+//     Ok(())
+// }
+
+pub async fn attach() -> Result<(), Box<dyn std::error::Error>> {
+    let semaphore = Arc::new(Semaphore::new(10)); // Limiting to 10 concurrent tasks
+
     loop {
-        if let Some(payment_task) = next(){
-            perform(payment_task);
+        if let Some(payment_task) = next() {
+            let permit = semaphore.clone().acquire_owned().await?;
+            task::spawn(async move {
+                perform(payment_task).await;
+                drop(permit);
+            });
         } else {
-            println!("waiting ...");
-            thread::sleep(ten_millis)
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await; // Non-blocking sleep
         }
     }
 
