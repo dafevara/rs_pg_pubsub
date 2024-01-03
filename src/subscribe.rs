@@ -10,7 +10,7 @@ use postgres::row::Row;
 use indicatif::ProgressBar;
 use std::{thread, time};
 use tokio::task;
-use tokio_postgres::{NoTls, Error as PgError};
+use tokio_postgres::{NoTls as TNoTls, Error as PgError};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -49,24 +49,28 @@ async fn next() -> Result<Option<PaymentTask>, PgError> {
         RETURNING id, payment_id, tries_left, error, processing, updated_at
     "#;
 
-    let row = pg.query_one(query, &[]).await?;
-    let p_task = PaymentTask::from(row);
+    let result = match pg.query_one(query, &[]).await {
+        Ok(result) => Some(PaymentTask::from(result)),
+        Err(desc) => None
+    };
 
+    Ok(result)
 }
 
-fn success(payment_task: PaymentTask, payment: Payment, product: Product, new_balance: i32) -> () {
+async fn success(payment_task: PaymentTask, payment: Payment, product: Product, new_balance: i32) -> Result<(), PgError> {
 
     let desc: String = db::connection_desc();
-    let mut pg = db::get_client();
+    let pg = db::get_client().await?;
 
     // update user's with new balance
+    // let mut q = "update users set balance = $1 where id = $2";
     let mut q = "update users set balance = $1 where id = $2";
-    if let Err(err_update) = pg.execute(q, &[&new_balance, &payment.user_id]) {
+    if let Err(err_update) = pg.execute(q, &[&new_balance, &payment.user_id]).await {
         panic!("{:?}", err_update);
     }
     // update payment with success state
-    let mut q = "update payments set status = $1 where id = $2";
-    if let Err(err_update) = pg.execute(q, &[&"accepted", &payment_task.payment_id]) {
+    q = "update payments set status = $1 where id = $2";
+    if let Err(err_update) = pg.execute(q, &[&"accepted", &payment_task.payment_id]).await {
         panic!("{:?}", err_update);
     }
 
@@ -76,79 +80,82 @@ fn success(payment_task: PaymentTask, payment: Payment, product: Product, new_ba
     let new_stock = (product.stock - 1);
     println!("New Stock: {:?}", new_stock);
     let mut q = "update products set stock = $1 where id = $2";
-    if let Err(err_update) = pg.execute(q, &[&new_stock, &product.id]) {
+    if let Err(err_update) = pg.execute(q, &[&new_stock, &product.id]).await {
         panic!("{:?}", err_update);
     }
 
     // remove message from queue
     let query = "delete from payment_tasks where id = $1";
-    if let Err(err_delete) = pg.execute(query, &[&payment_task.id]) {
+    if let Err(err_delete) = pg.execute(query, &[&payment_task.id]).await {
         panic!("{:?}", err_delete);
     }
+
+    Ok(())
 }
 
-fn failed_by_balance (payment_task: PaymentTask, user: User, payment: Payment, product: Product) -> () {
+async fn failed_by_balance (payment_task: PaymentTask, user: User, payment: Payment, product: Product) -> Result<(), PgError> {
 
     let balance: i32 = user.balance;
     let price: i32 = product.price;
     let msg = format!("Unable to pay because price: {} is greater than balance {}", price, balance);
 
+    println!("Failed: {:?}", msg);
+
     let desc: String = db::connection_desc();
-    let mut pg = db::get_client();
+    let pg = db::get_client().await?;
 
     let mut q = "update payment_tasks set error = $1 where id = $2";
-    if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]) {
+    if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]).await {
         panic!("{:?}", err_update);
     }
 
-    let mut q = "update payments set status = 'rejected' where id = $1 ";
-    if let Err(err_update) = pg.execute(q, &[&payment.id]) {
+    q = "update payments set status = 'rejected' where id = $1 ";
+    if let Err(err_update) = pg.execute(q, &[&payment.id]).await {
         panic!("{:?}", err_update);
     }
+
+    Ok(())
 }
 
-fn failed_by_stock (payment_task: PaymentTask, user: User, payment: Payment) -> () {
+async fn failed_by_stock (payment_task: PaymentTask, user: User, payment: Payment) -> Result<(), PgError> {
     let msg = "Unable to pay because there's no stock";
+    println!("Failed: {:?}", msg);
     let desc: String = db::connection_desc();
-    let mut pg = db::get_client();
+    let pg = db::get_client().await?;
 
-    let mut q = "update payment_tasks set error = $1 where id = $2";
-    if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]) {
+    let mut q = "update payment_tasks set error = $1, tries_left = 0 where id = $2";
+    if let Err(err_update) = pg.execute(q, &[&msg, &payment_task.id]).await {
         panic!("{:?}", err_update);
     }
 
     let mut q = "update payments set status = 'rejected' where id = $1 ";
-    if let Err(err_update) = pg.execute(q, &[&payment.id]) {
+    if let Err(err_update) = pg.execute(q, &[&payment.id]).await {
         panic!("{:?}", err_update);
     }
+
+    Ok(())
 }
 
-async fn perform(payment_task: PaymentTask) -> () {
-    println!("Processing Task: {:?}", payment_task);
+async fn perform(payment_task: PaymentTask) -> Result<(), PgError>{
+    println!("Processing Task: {:?}", payment_task.id);
 
     let desc: String = db::connection_desc();
-    let mut pg = db::get_client();
+    let pg = db::get_client().await?;
 
     let mut q = "select * from payments where id = $1";
-    let payment = match pg.query_one(q, &[&payment_task.payment_id]) {
-        Ok(payment) => Payment::from(payment),
-        Err(desc) => panic!("No payment was found")
-    };
-    println!("Payment: {:?}", payment);
+    let payment_row = pg.query_one(q, &[&payment_task.payment_id]).await?;
+    let payment = Payment::from(payment_row);
+    println!("Payment: {:?}", payment.id);
 
     let mut q = "select * from users where id = $1";
-    let user = match pg.query_one(q, &[&payment.user_id]) {
-        Ok(user) => User::from(user),
-        Err(desc) => panic!("no user found")
-    };
-    println!("for User: {:?}", user);
+    let user_row = pg.query_one(q, &[&payment.user_id]).await?;
+    let user = User::from(user_row);
+    println!("for User: {:?}", user.id);
 
     let mut q = "select * from products where id = $1";
-    let product = match pg.query_one(q, &[&payment.product_id]) {
-        Ok(product) => Product::from(product),
-        Err(desc) => panic!("no user found")
-    };
-    println!("{:?}", product);
+    let product_row = pg.query_one(q, &[&payment.product_id]).await?;
+    let product = Product::from(product_row);
+    println!("Product {:?}", product.id);
 
     let balance: i32 = user.balance;
     let price: i32 = product.price;
@@ -158,35 +165,21 @@ async fn perform(payment_task: PaymentTask) -> () {
     let new_stock: i32 = stock - 1;
 
     if (new_balance < 0) {
-        failed_by_balance(payment_task, user, payment, product)
+        failed_by_balance(payment_task, user, payment, product).await?
     } else if (new_stock < 0) {
-
-        failed_by_stock(payment_task, user, payment)
+        failed_by_stock(payment_task, user, payment).await?
     } else {
-        success(payment_task, payment, product, new_balance)
+        success(payment_task, payment, product, new_balance).await?
     }
 
+    Ok(())
 }
 
-// pub fn attach() -> Result<(), std::io::Error> {
-//     let ten_millis = time::Duration::from_millis(5);
-//     loop {
-//         if let Some(payment_task) = next(){
-//             perform(payment_task);
-//         } else {
-//             println!("waiting ...");
-//             thread::sleep(ten_millis)
-//         }
-//     }
-//
-//     Ok(())
-// }
-
-pub async fn attach() -> Result<(), Box<dyn std::error::Error>> {
-    let semaphore = Arc::new(Semaphore::new(10)); // Limiting to 10 concurrent tasks
+pub async fn attach(concurrency_limit: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let semaphore = Arc::new(Semaphore::new(concurrency_limit as usize)); // Limiting to 10 concurrent tasks
 
     loop {
-        if let Some(payment_task) = next() {
+        if let Some(payment_task) = next().await? {
             let permit = semaphore.clone().acquire_owned().await?;
             task::spawn(async move {
                 perform(payment_task).await;
