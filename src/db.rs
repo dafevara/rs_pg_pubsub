@@ -3,9 +3,12 @@ extern crate dotenv;
 
 use dotenv::dotenv;
 use std::env;
-use postgres::{Client, NoTls};
+use postgres::{Client};
+use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
+use r2d2::{Pool, PooledConnection};
+use lazy_static::lazy_static;
 use indicatif::ProgressBar;
-
+use tokio_postgres::{NoTls as TNoTls, Error as PgError};
 
 pub fn connection_desc() -> String {
     dotenv().ok();
@@ -18,15 +21,42 @@ pub fn connection_desc() -> String {
     return desc.to_string()
 }
 
-pub fn create_tables() -> Result<(), postgres::Error>{
+lazy_static! {
+    static ref POOL: Pool<PostgresConnectionManager<NoTls>> = {
+        let desc: String = connection_desc();
+        let manager = PostgresConnectionManager::new(
+            desc.parse().unwrap(),
+            NoTls,
+        );
+
+        Pool::new(manager).expect("Failed to create pool.")
+    };
+}
+
+pub fn get_connection() -> PooledConnection<PostgresConnectionManager<NoTls>> {
+    POOL.get().expect("Failed to get a pooled connection")
+}
+
+pub async fn get_client() -> Result<tokio_postgres::Client, PgError> {
+    let desc: String = connection_desc();
+    let (client, connection) = tokio_postgres::connect(
+        desc.as_str(),
+        TNoTls
+    ).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
+pub async fn create_tables() -> Result<(), postgres::Error>{
 
     let desc: String = connection_desc();
-    let connect = Client::connect(&desc, NoTls);
-    let mut pg = match connect {
-        Ok(client) => client,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
-
+    let mut pg = get_client().await?;
     pg.batch_execute("drop table if exists users cascade;
         create table if not exists users (
             id serial primary key,
@@ -43,18 +73,13 @@ pub fn create_tables() -> Result<(), postgres::Error>{
             discount int not null default 0
         );
 
-        drop type if exists payment_status cascade;
-        create type payment_status as enum (
-            'accepted', 'failed', 'pending'
-        );
-
         drop table if exists payments cascade;
         create table if not exists payments (
             id serial primary key,
             product_id int,
             user_id int,
             amount int not null default 0,
-            status payment_status default 'pending',
+            status text default 'pending',
             CONSTRAINT fk_product_id
                 FOREIGN KEY(product_id)
                 REFERENCES products(id),
@@ -93,11 +118,13 @@ pub fn create_tables() -> Result<(), postgres::Error>{
         FOR EACH ROW
         EXECUTE FUNCTION insert_into_payment_task();
 
-    ")
+    ").await?;
+
+    Ok(())
 }
 
 
-pub fn populate_base_data(n: i32) -> Result<(), std::io::Error> {
+pub async fn populate_base_data(n: i32) -> Result<(), PgError> {
 
     use fake::{Dummy, Fake, Faker};
     use fake::faker::name::en::*;
@@ -127,10 +154,7 @@ pub fn populate_base_data(n: i32) -> Result<(), std::io::Error> {
     }
 
     let desc: String = connection_desc();
-    let mut pg = match Client::connect(&desc, NoTls) {
-        Ok(pg) => pg,
-        Err(err_desc) => panic!("{:?}", err_desc)
-    };
+    let mut pg = get_client().await?;
 
     println!("Populating users");
 
@@ -138,7 +162,7 @@ pub fn populate_base_data(n: i32) -> Result<(), std::io::Error> {
     for _ in 0..n {
         let u: FakeUser = Faker.fake();
         let query = "insert into users (name, email, balance) values ($1, $2, $3)";
-        if let Err(err_insert) = pg.execute(query, &[&u.name, &u.email, &u.balance]) {
+        if let Err(err_insert) = pg.execute(query, &[&u.name, &u.email, &u.balance]).await {
             panic!("{:?}", err_insert);
         }
         bar.inc(1)
@@ -153,7 +177,7 @@ pub fn populate_base_data(n: i32) -> Result<(), std::io::Error> {
     for _ in 0..(n/10) {
         let p: FakeProduct = Faker.fake();
         let query = "insert into products (name, price, stock, discount) values ($1, $2, $3, $4)";
-        if let Err(err_insert) = pg.execute(query, &[&p.name, &p.price, &p.stock, &p.discount]) {
+        if let Err(err_insert) = pg.execute(query, &[&p.name, &p.price, &p.stock, &p.discount]).await {
             panic!("{:?}", err_insert);
         }
         bar.inc(1);

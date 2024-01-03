@@ -1,6 +1,8 @@
 #![allow(unused)]
 
 use clap::{Parser, Subcommand};
+use tokio::sync::Mutex;
+use futures::executor::block_on;
 
 mod db;
 mod publish;
@@ -33,33 +35,31 @@ struct Cli {
     command: Option<Cmd>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
         Some(Cmd::Init { reset }) => {
-            if let Err(err_desc) = db::create_tables() {
+            if let Err(err_desc) = db::create_tables().await {
                 panic!("{:?}", err_desc)
             };
         },
         Some(Cmd::Populate { n } ) => {
-            if let Err(err_populate) = db::populate_base_data(*n) {
+            if let Err(err_populate) = db::populate_base_data(*n).await {
                 panic!("{:?}", err_populate)
             }
         },
         Some(Cmd::Publish { n }) => {
-            if let Err(err_publish) = publish::payments(*n) {
+            if let Err(err_publish) = publish::payments(*n).await {
                 panic!("{:?}", err_publish)
             }
         },
         Some(Cmd::Subscribe {channel, workers}) => {
-            if let Err(err_subscribe) = subscribe::attach() {
-                panic!("{:?}", err_subscribe)
+            if let Err(e) = subscribe::attach(*workers).await {
+                panic!("An error occurred: {}", e);
             }
         },
         None => {}
     }
-
-
-
 }
